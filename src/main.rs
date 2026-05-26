@@ -273,18 +273,88 @@ const fn make_k_index(start: usize, shift: usize) -> [usize; 16] {
     buffer
 }
 
-fn padding_content(mut bytes: Vec<u8>) -> Vec<u8> {
-    let bit_len = (bytes.len() as u64) * 8;
+//fn padding_content(mut bytes: Vec<u8>) -> Vec<u8> {
+//    let bit_len = (bytes.len() as u64) * 8;
+//
+//    bytes.push(0x80);
+//
+//    while bytes.len() % 64 != 56 {
+//        bytes.push(0x0);
+//    }
+//
+//    bytes.extend_from_slice(&bit_len.to_le_bytes());
+//
+//    bytes
+//}
 
-    bytes.push(0x80);
+impl CCMd5 {
+    fn padding_content(&self, mut bytes: Vec<u8>) -> Vec<u8> {
+        let bit_len = (bytes.len() as u64) * 8;
 
-    while bytes.len() % 64 != 56 {
-        bytes.push(0x0);
+        bytes.push(0x80);
+
+        while bytes.len() % 64 != 56 {
+            bytes.push(0x0);
+        }
+
+        bytes.extend_from_slice(&bit_len.to_le_bytes());
+
+        bytes
     }
 
-    bytes.extend_from_slice(&bit_len.to_le_bytes());
+    fn reset_state(&mut self) {
+        let new_state = State {
+            values: self.hash,
+            i: 0,
+        };
+        self.state = new_state;
+    }
 
-    bytes
+    fn update_hash(&mut self) {
+        self.hash = std::array::from_fn(|i| self.hash[i].wrapping_add(self.state.values[i]));
+    }
+
+    fn rot(&mut self) {
+        self.state.values.rotate_right(1);
+    }
+
+    fn round<F>(&mut self, block: [u32; 16], k_v: [usize; 16], s_v: [u32; 4], f: &F)
+    where
+        F: Fn(u32, u32, u32) -> u32,
+    {
+        for i in 0..4 {
+            self.block(k_v[i * 4], s_v[0], f, block);
+            self.block(k_v[i * 4 + 1], s_v[1], f, block);
+            self.block(k_v[i * 4 + 2], s_v[2], f, block);
+            self.block(k_v[i * 4 + 3], s_v[3], f, block);
+        }
+    }
+
+    fn block<F>(&mut self, k: usize, s: u32, f: F, x: [u32; 16])
+    where
+        F: Fn(u32, u32, u32) -> u32,
+    {
+        self.state.values[0] = Self::mixer(&mut self.state, k, s, f, x, self.table);
+        self.state.i += 1;
+        self.rot();
+    }
+
+    fn mixer<F>(state: &mut State, k: usize, s: u32, f: F, x: [u32; 16], table: [u32; 64]) -> u32
+    where
+        F: Fn(u32, u32, u32) -> u32,
+    {
+        //b + ((a + f(b, c, d) + x[k] + table[i]) << s)
+        let f_res = f(state.values[1], state.values[2], state.values[3]);
+
+        let sum = state.values[0]
+            .wrapping_add(f_res)
+            .wrapping_add(x[k])
+            .wrapping_add(table[state.i]);
+
+        let rot = sum.rotate_left(s);
+
+        state.values[1].wrapping_add(rot)
+    }
 }
 
 fn rounds(content: Vec<u8>) -> Vec<u8> {
@@ -293,9 +363,16 @@ fn rounds(content: Vec<u8>) -> Vec<u8> {
     let mut C: u32 = 0x98badcfe;
     let mut D: u32 = 0x10325476;
 
-    let table = make_table::<64>();
+    let mut ccmd5 = CCMd5 {
+        hash: [A, B, C, D],
+        table: make_table::<64>(),
+        state: State {
+            values: [A, B, C, D],
+            i: 0,
+        },
+    };
 
-    let bytes = padding_content(content);
+    let bytes = ccmd5.padding_content(content);
     let mut buffer_msg = [0u32; 16];
 
     for chunk in bytes.chunks_exact(64) {
@@ -304,250 +381,35 @@ fn rounds(content: Vec<u8>) -> Vec<u8> {
                 u32::from_le_bytes([word_bytes[0], word_bytes[1], word_bytes[2], word_bytes[3]]);
         }
 
-        let mut a = A;
-        let mut b = B;
-        let mut c = C;
-        let mut d = D;
+        ccmd5.reset_state();
 
         // MD5 uses K[0..63] in order across all 4 rounds.
-        let mut step: usize = 0;
 
         // Round 1
         let k_values = make_k_index(0, 1);
         let s: [u32; 4] = [7, 12, 17, 22];
-        for i in 0..4 {
-            a = iter(
-                a,
-                b,
-                c,
-                d,
-                k_values[i * 4],
-                s[0],
-                step,
-                Fm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            d = iter(
-                d,
-                a,
-                b,
-                c,
-                k_values[i * 4 + 1],
-                s[1],
-                step,
-                Fm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            c = iter(
-                c,
-                d,
-                a,
-                b,
-                k_values[i * 4 + 2],
-                s[2],
-                step,
-                Fm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            b = iter(
-                b,
-                c,
-                d,
-                a,
-                k_values[i * 4 + 3],
-                s[3],
-                step,
-                Fm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-        }
+
+        ccmd5.round(buffer_msg, k_values, s, &Fm);
 
         // Round 2
         let k_values = make_k_index(1, 5);
         let s: [u32; 4] = [5, 9, 14, 20];
-        for i in 0..4 {
-            a = iter(
-                a,
-                b,
-                c,
-                d,
-                k_values[i * 4],
-                s[0],
-                step,
-                Gm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            d = iter(
-                d,
-                a,
-                b,
-                c,
-                k_values[i * 4 + 1],
-                s[1],
-                step,
-                Gm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            c = iter(
-                c,
-                d,
-                a,
-                b,
-                k_values[i * 4 + 2],
-                s[2],
-                step,
-                Gm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            b = iter(
-                b,
-                c,
-                d,
-                a,
-                k_values[i * 4 + 3],
-                s[3],
-                step,
-                Gm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-        }
+
+        ccmd5.round(buffer_msg, k_values, s, &Gm);
 
         // Round 3
         let k_values = make_k_index(5, 3);
         let s: [u32; 4] = [4, 11, 16, 23];
-        for i in 0..4 {
-            a = iter(
-                a,
-                b,
-                c,
-                d,
-                k_values[i * 4],
-                s[0],
-                step,
-                Hm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            d = iter(
-                d,
-                a,
-                b,
-                c,
-                k_values[i * 4 + 1],
-                s[1],
-                step,
-                Hm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            c = iter(
-                c,
-                d,
-                a,
-                b,
-                k_values[i * 4 + 2],
-                s[2],
-                step,
-                Hm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            b = iter(
-                b,
-                c,
-                d,
-                a,
-                k_values[i * 4 + 3],
-                s[3],
-                step,
-                Hm,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-        }
+
+        ccmd5.round(buffer_msg, k_values, s, &Hm);
 
         // Round 4
         let k_values = make_k_index(0, 7);
         let s: [u32; 4] = [6, 10, 15, 21];
-        for i in 0..4 {
-            a = iter(
-                a,
-                b,
-                c,
-                d,
-                k_values[i * 4],
-                s[0],
-                step,
-                Im,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            d = iter(
-                d,
-                a,
-                b,
-                c,
-                k_values[i * 4 + 1],
-                s[1],
-                step,
-                Im,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            c = iter(
-                c,
-                d,
-                a,
-                b,
-                k_values[i * 4 + 2],
-                s[2],
-                step,
-                Im,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-            b = iter(
-                b,
-                c,
-                d,
-                a,
-                k_values[i * 4 + 3],
-                s[3],
-                step,
-                Im,
-                buffer_msg,
-                table,
-            );
-            step += 1;
-        }
 
-        A = A.wrapping_add(a);
-        B = B.wrapping_add(b);
-        C = C.wrapping_add(c);
-        D = D.wrapping_add(d);
+        ccmd5.round(buffer_msg, k_values, s, &Im);
+
+        ccmd5.update_hash();
     }
 
     let mut digest: Vec<u8> = Vec::new();
@@ -558,6 +420,15 @@ fn rounds(content: Vec<u8>) -> Vec<u8> {
     digest
 }
 
+struct CCMd5 {
+    hash: [u32; 4],
+    table: [u32; 64],
+    state: State,
+}
+struct State {
+    values: [u32; 4],
+    i: usize,
+}
 fn iter<F>(
     a: u32,
     b: u32,
