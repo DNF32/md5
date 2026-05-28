@@ -247,7 +247,11 @@ fn digest_msg(contents: &str) -> String {
 
 fn digest_msg_mine(contents: &str) -> String {
     let out = rounds(Vec::from(contents.as_bytes()));
-    let hash_hex: String = out.iter().map(|byte| format!("{:02x}", byte)).collect();
+    let hash_hex: String = out
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .map(|byte| format!("{:02x}", byte))
+        .collect();
     hash_hex
 }
 
@@ -357,7 +361,7 @@ impl CCMd5 {
     }
 }
 
-fn rounds(content: Vec<u8>) -> Vec<u8> {
+fn rounds(content: Vec<u8>) -> [u32; 4] {
     let mut A: u32 = 0x67452301;
     let mut B: u32 = 0xefcdab89;
     let mut C: u32 = 0x98badcfe;
@@ -412,12 +416,7 @@ fn rounds(content: Vec<u8>) -> Vec<u8> {
         ccmd5.update_hash();
     }
 
-    let mut digest: Vec<u8> = Vec::new();
-    digest.extend(A.to_le_bytes());
-    digest.extend(B.to_le_bytes());
-    digest.extend(C.to_le_bytes());
-    digest.extend(D.to_le_bytes());
-    digest
+    ccmd5.hash
 }
 
 struct CCMd5 {
@@ -428,33 +427,6 @@ struct CCMd5 {
 struct State {
     values: [u32; 4],
     i: usize,
-}
-fn iter<F>(
-    a: u32,
-    b: u32,
-    c: u32,
-    d: u32,
-    k: usize,
-    s: u32,
-    i: usize,
-    f: F,
-    x: [u32; 16],
-    table: [u32; 64],
-) -> u32
-where
-    F: Fn(u32, u32, u32) -> u32,
-{
-    //b + ((a + f(b, c, d) + x[k] + table[i]) << s)
-    let f_res = f(b, c, d);
-
-    let sum = a
-        .wrapping_add(f_res)
-        .wrapping_add(x[k])
-        .wrapping_add(table[i]);
-
-    let rot = sum.rotate_left(s);
-
-    b.wrapping_add(rot)
 }
 
 fn Fm(b: u32, c: u32, d: u32) -> u32 {
