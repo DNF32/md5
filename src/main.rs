@@ -72,10 +72,21 @@ impl File {
         }
     }
 
-    fn read_file(&self) -> Result<String, io::Error> {
+    fn read_file(&self) -> Result<Vec<u8>, io::Error> {
         match self {
             Self::StdIn => {
-                let mut buffer = String::new();
+                let mut buffer: Vec<u8> = Vec::new();
+                io::stdin().read(&mut buffer)?;
+                Ok(buffer)
+            }
+            Self::FilePath(path) => fs::read(path),
+        }
+    }
+
+    fn read_file_as_str(&self) -> Result<String, io::Error> {
+        match self {
+            Self::StdIn => {
+                let mut buffer: String = String::new();
                 io::stdin().read_to_string(&mut buffer)?;
                 Ok(buffer)
             }
@@ -105,7 +116,7 @@ impl File {
 
     fn validate_file(&self, config: &Config, error: &mut ErrorCount) -> String {
         let mut outs: Vec<String> = Vec::new();
-        if let Ok(contents) = self.read_file() {
+        if let Ok(contents) = self.read_file_as_str() {
             for line in contents.lines() {
                 let parts: Vec<&str> = line.split("  ").collect();
                 if parts.len() >= 2 {
@@ -237,16 +248,16 @@ fn main() {
     }
 }
 
-fn digest_msg(contents: &str) -> String {
+fn digest_msg(contents: &[u8]) -> String {
     let mut hasher = Md5::new();
-    hasher.update(contents.as_bytes());
+    hasher.update(contents);
     let hash: [u8; 16] = hasher.finalize().into();
     let hash_hex: String = hash.iter().map(|byte| format!("{:02x}", byte)).collect();
     hash_hex
 }
 
-fn digest_msg_mine(contents: &str) -> String {
-    let out = rounds(Vec::from(contents.as_bytes()));
+fn digest_msg_mine(contents: &[u8]) -> String {
+    let out = rounds(contents);
     let hash_hex: String = out
         .iter()
         .flat_map(|word| word.to_le_bytes())
@@ -292,6 +303,21 @@ const fn make_k_index(start: usize, shift: usize) -> [usize; 16] {
 //}
 
 impl CCMd5 {
+    fn new() -> Self {
+        let mut A: u32 = 0x67452301;
+        let mut B: u32 = 0xefcdab89;
+        let mut C: u32 = 0x98badcfe;
+        let mut D: u32 = 0x10325476;
+
+        CCMd5 {
+            hash: [A, B, C, D],
+            table: make_table::<64>(),
+            state: State {
+                values: [A, B, C, D],
+                i: 0,
+            },
+        }
+    }
     fn padding_content(&self, mut bytes: Vec<u8>) -> Vec<u8> {
         let bit_len = (bytes.len() as u64) * 8;
 
@@ -322,7 +348,7 @@ impl CCMd5 {
         self.state.values.rotate_right(1);
     }
 
-    fn round<F>(&mut self, block: [u32; 16], k_v: [usize; 16], s_v: [u32; 4], f: &F)
+    fn round<F>(&mut self, block: &[u32; 16], k_v: [usize; 16], s_v: [u32; 4], f: &F)
     where
         F: Fn(u32, u32, u32) -> u32,
     {
@@ -334,16 +360,16 @@ impl CCMd5 {
         }
     }
 
-    fn block<F>(&mut self, k: usize, s: u32, f: F, x: [u32; 16])
+    fn block<F>(&mut self, k: usize, s: u32, f: F, x: &[u32; 16])
     where
         F: Fn(u32, u32, u32) -> u32,
     {
-        self.state.values[0] = Self::mixer(&mut self.state, k, s, f, x, self.table);
+        self.state.values[0] = Self::mixer(&mut self.state, k, s, f, x, &self.table);
         self.state.i += 1;
         self.rot();
     }
 
-    fn mixer<F>(state: &mut State, k: usize, s: u32, f: F, x: [u32; 16], table: [u32; 64]) -> u32
+    fn mixer<F>(state: &mut State, k: usize, s: u32, f: F, x: &[u32; 16], table: &[u32; 64]) -> u32
     where
         F: Fn(u32, u32, u32) -> u32,
     {
@@ -361,20 +387,10 @@ impl CCMd5 {
     }
 }
 
-fn rounds(content: Vec<u8>) -> [u32; 4] {
-    let mut A: u32 = 0x67452301;
-    let mut B: u32 = 0xefcdab89;
-    let mut C: u32 = 0x98badcfe;
-    let mut D: u32 = 0x10325476;
+fn rounds(content: &[u8]) -> [u32; 4] {
+    let content = content.to_vec();
 
-    let mut ccmd5 = CCMd5 {
-        hash: [A, B, C, D],
-        table: make_table::<64>(),
-        state: State {
-            values: [A, B, C, D],
-            i: 0,
-        },
-    };
+    let mut ccmd5 = CCMd5::new();
 
     let bytes = ccmd5.padding_content(content);
     let mut buffer_msg = [0u32; 16];
@@ -393,25 +409,25 @@ fn rounds(content: Vec<u8>) -> [u32; 4] {
         let k_values = make_k_index(0, 1);
         let s: [u32; 4] = [7, 12, 17, 22];
 
-        ccmd5.round(buffer_msg, k_values, s, &Fm);
+        ccmd5.round(&buffer_msg, k_values, s, &Fm);
 
         // Round 2
         let k_values = make_k_index(1, 5);
         let s: [u32; 4] = [5, 9, 14, 20];
 
-        ccmd5.round(buffer_msg, k_values, s, &Gm);
+        ccmd5.round(&buffer_msg, k_values, s, &Gm);
 
         // Round 3
         let k_values = make_k_index(5, 3);
         let s: [u32; 4] = [4, 11, 16, 23];
 
-        ccmd5.round(buffer_msg, k_values, s, &Hm);
+        ccmd5.round(&buffer_msg, k_values, s, &Hm);
 
         // Round 4
         let k_values = make_k_index(0, 7);
         let s: [u32; 4] = [6, 10, 15, 21];
 
-        ccmd5.round(buffer_msg, k_values, s, &Im);
+        ccmd5.round(&buffer_msg, k_values, s, &Im);
 
         ccmd5.update_hash();
     }
