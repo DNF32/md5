@@ -11,6 +11,7 @@ struct Config {
     c_flag: bool,
     mine: bool,
     quiet_flag: bool,
+    alg: String,
 }
 
 struct ErrorCount {
@@ -109,6 +110,8 @@ impl File {
         let content = self.read_file()?;
         if config.mine {
             Ok(digest_msg_mine(&content))
+        } else if config.alg == "sha256" {
+            Ok(digest_sha256_msg_mine(&content))
         } else {
             Ok(digest_msg(&content))
         }
@@ -182,9 +185,12 @@ fn parse_flag(args: Vec<String>) -> (Config, Vec<File>) {
     let mut c_flag = false;
     let mut mine = false;
     let mut quiet_flag = false;
+    let mut alg = String::new();
     let mut inputs: Vec<File> = Vec::new();
 
-    for arg in args {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         if arg == "-b" {
             b_flag = true;
         } else if arg == "-c" {
@@ -193,9 +199,13 @@ fn parse_flag(args: Vec<String>) -> (Config, Vec<File>) {
             quiet_flag = true
         } else if arg == "--mine" {
             mine = true
+        } else if arg == "--algorithm" {
+            alg = args[i + 1].clone();
+            i += 1;
         } else {
-            inputs.push(File::from(arg));
+            inputs.push(File::from(arg.as_str()));
         }
+        i += 1;
     }
 
     (
@@ -204,6 +214,7 @@ fn parse_flag(args: Vec<String>) -> (Config, Vec<File>) {
             c_flag: c_flag,
             quiet_flag: quiet_flag,
             mine: mine,
+            alg: alg,
         },
         inputs,
     )
@@ -248,7 +259,7 @@ fn main() {
     }
 }
 
-fn digest_msg(contents: &[u8]) -> String {
+fn digest_msg(contents: impl AsRef<[u8]>) -> String {
     let mut hasher = Md5::new();
     hasher.update(contents);
     let hash: [u8; 16] = hasher.finalize().into();
@@ -256,14 +267,22 @@ fn digest_msg(contents: &[u8]) -> String {
     hash_hex
 }
 
-fn digest_msg_mine(contents: &[u8]) -> String {
-    let out = rounds(contents);
-    let hash_hex: String = out
-        .iter()
+fn digest_msg_mine(contents: impl AsRef<[u8]>) -> String {
+    let mut hasher = CCMd5::new();
+    hasher.update(contents);
+    let out = hasher.finalize();
+
+    out.iter()
         .flat_map(|word| word.to_le_bytes())
         .map(|byte| format!("{:02x}", byte))
-        .collect();
-    hash_hex
+        .collect()
+}
+
+fn digest_sha256_msg_mine(contents: impl AsRef<[u8]>) -> String {
+    let mut hasher = CCSha256::new();
+    hasher.update(contents);
+    let out = hasher.finalize();
+    out.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
 
 const MAGIC: f64 = 4294967296.0;
@@ -288,20 +307,6 @@ const fn make_k_index(start: usize, shift: usize) -> [usize; 16] {
     buffer
 }
 
-//fn padding_content(mut bytes: Vec<u8>) -> Vec<u8> {
-//    let bit_len = (bytes.len() as u64) * 8;
-//
-//    bytes.push(0x80);
-//
-//    while bytes.len() % 64 != 56 {
-//        bytes.push(0x0);
-//    }
-//
-//    bytes.extend_from_slice(&bit_len.to_le_bytes());
-//
-//    bytes
-//}
-
 impl CCMd5 {
     fn new() -> Self {
         let mut A: u32 = 0x67452301;
@@ -316,20 +321,9 @@ impl CCMd5 {
                 values: [A, B, C, D],
                 i: 0,
             },
+            buffer: Vec::new(),
+            message_len: 0,
         }
-    }
-    fn padding_content(&self, mut bytes: Vec<u8>) -> Vec<u8> {
-        let bit_len = (bytes.len() as u64) * 8;
-
-        bytes.push(0x80);
-
-        while bytes.len() % 64 != 56 {
-            bytes.push(0x0);
-        }
-
-        bytes.extend_from_slice(&bit_len.to_le_bytes());
-
-        bytes
     }
 
     fn reset_state(&mut self) {
@@ -345,7 +339,11 @@ impl CCMd5 {
     }
 
     fn rot(&mut self) {
-        self.state.values.rotate_right(1);
+        let tmp = self.state.values[3];
+        self.state.values[3] = self.state.values[2];
+        self.state.values[2] = self.state.values[1];
+        self.state.values[1] = self.state.values[0];
+        self.state.values[0] = tmp;
     }
 
     fn round<F>(&mut self, block: &[u32; 16], k_v: [usize; 16], s_v: [u32; 4], f: &F)
@@ -385,104 +383,314 @@ impl CCMd5 {
 
         state.values[1].wrapping_add(rot)
     }
-}
 
-fn rounds(content: &[u8]) -> [u32; 4] {
-    let content = content.to_vec();
+    fn process_block(&mut self, content: &[u8; 64]) {
+        debug_assert_eq!(content.len(), 64);
 
-    let mut ccmd5 = CCMd5::new();
+        let mut buffer_msg = [0u32; 16];
 
-    let bytes = ccmd5.padding_content(content);
-    let mut buffer_msg = [0u32; 16];
-
-    for chunk in bytes.chunks_exact(64) {
-        for (i, word_bytes) in chunk.chunks_exact(4).enumerate() {
+        for (i, word_bytes) in content.chunks_exact(4).enumerate() {
             buffer_msg[i] =
                 u32::from_le_bytes([word_bytes[0], word_bytes[1], word_bytes[2], word_bytes[3]]);
         }
 
-        ccmd5.reset_state();
-
-        // MD5 uses K[0..63] in order across all 4 rounds.
+        self.reset_state();
 
         // Round 1
-        let k_values = make_k_index(0, 1);
-        let s: [u32; 4] = [7, 12, 17, 22];
-
-        ccmd5.round(&buffer_msg, k_values, s, &Fm);
+        self.round(&buffer_msg, make_k_index(0, 1), [7, 12, 17, 22], &Fm);
 
         // Round 2
-        let k_values = make_k_index(1, 5);
-        let s: [u32; 4] = [5, 9, 14, 20];
-
-        ccmd5.round(&buffer_msg, k_values, s, &Gm);
+        self.round(&buffer_msg, make_k_index(1, 5), [5, 9, 14, 20], &Gm);
 
         // Round 3
-        let k_values = make_k_index(5, 3);
-        let s: [u32; 4] = [4, 11, 16, 23];
-
-        ccmd5.round(&buffer_msg, k_values, s, &Hm);
+        self.round(&buffer_msg, make_k_index(5, 3), [4, 11, 16, 23], &Hm);
 
         // Round 4
-        let k_values = make_k_index(0, 7);
-        let s: [u32; 4] = [6, 10, 15, 21];
+        self.round(&buffer_msg, make_k_index(0, 7), [6, 10, 15, 21], &Im);
 
-        ccmd5.round(&buffer_msg, k_values, s, &Im);
-
-        ccmd5.update_hash();
+        self.update_hash();
     }
 
-    ccmd5.hash
+    fn update(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.message_len += input.len() as u64;
+        self.buffer.extend_from_slice(input);
+
+        while self.buffer.len() >= 64 {
+            let block: Vec<u8> = self.buffer.drain(..64).collect();
+            self.process_block(&block.try_into().unwrap());
+        }
+    }
+
+    fn finalize(mut self) -> [u32; 4] {
+        let bit_len = self.message_len * 8;
+
+        self.buffer.push(0x80);
+
+        while self.buffer.len() % 64 != 56 {
+            self.buffer.push(0);
+        }
+
+        self.buffer.extend_from_slice(&bit_len.to_le_bytes());
+
+        let final_blocks = std::mem::take(&mut self.buffer);
+        for block in final_blocks.chunks_exact(64) {
+            self.process_block(block.try_into().unwrap());
+        }
+
+        self.hash
+    }
 }
 
 struct CCMd5 {
     hash: [u32; 4],
     table: [u32; 64],
     state: State,
+    buffer: Vec<u8>,
+    message_len: u64,
 }
 struct State {
     values: [u32; 4],
     i: usize,
 }
 
+#[inline]
 fn Fm(b: u32, c: u32, d: u32) -> u32 {
     (b & c) | (!b & d)
 }
 
+#[inline]
 fn Gm(b: u32, c: u32, d: u32) -> u32 {
     (b & d) | (c & !d)
 }
 
+#[inline]
 fn Hm(b: u32, c: u32, d: u32) -> u32 {
     b ^ c ^ d
 }
 
+#[inline]
 fn Im(b: u32, c: u32, d: u32) -> u32 {
     c ^ (b | (!d))
+}
+
+trait Word: Sized {
+    const BITS: u32;
+    fn shr<const N: u32>(self) -> Self;
+    fn rotr<const N: u32>(self) -> Self;
+    fn rotl<const N: u32>(self) -> Self;
+
+    fn ch(x: Self, y: Self, z: Self) -> Self;
+    fn maj(x: Self, y: Self, z: Self) -> Self;
+    fn bsig0(x: Self) -> Self;
+    fn bsig1(x: Self) -> Self;
+    fn ssig0(x: Self) -> Self;
+    fn ssig1(x: Self) -> Self;
+}
+
+impl Word for u32 {
+    const BITS: u32 = 32;
+
+    fn shr<const N: u32>(self) -> Self {
+        const { assert!(N < Self::BITS) };
+        self >> N
+    }
+
+    fn rotr<const N: u32>(self) -> Self {
+        const { assert!(N < Self::BITS) };
+        (self >> N) | (self << (Self::BITS - N))
+    }
+
+    fn rotl<const N: u32>(self) -> Self {
+        const { assert!(N < Self::BITS) };
+        (self << N) | (self >> (Self::BITS - N))
+    }
+
+    fn ch(x: Self, y: Self, z: Self) -> Self {
+        (x & y) ^ ((!x) & z)
+    }
+    fn maj(x: Self, y: Self, z: Self) -> Self {
+        (x & y) ^ (x & z) ^ (y & z)
+    }
+    fn bsig0(x: Self) -> Self {
+        x.rotr::<2>() ^ x.rotr::<13>() ^ x.rotr::<22>()
+    }
+    fn bsig1(x: Self) -> Self {
+        x.rotr::<6>() ^ x.rotr::<11>() ^ x.rotr::<25>()
+    }
+    fn ssig0(x: Self) -> Self {
+        x.rotr::<7>() ^ x.rotr::<18>() ^ x.shr::<3>()
+    }
+    fn ssig1(x: Self) -> Self {
+        x.rotr::<17>() ^ x.rotr::<19>() ^ x.shr::<10>()
+    }
+}
+
+impl Word for u64 {
+    const BITS: u32 = 64;
+
+    fn shr<const N: u32>(self) -> Self {
+        const { assert!(N < Self::BITS) };
+        self >> N
+    }
+
+    fn rotr<const N: u32>(self) -> Self {
+        const { assert!(N < Self::BITS) };
+        (self >> N) | (self << (Self::BITS - N))
+    }
+    fn rotl<const N: u32>(self) -> Self {
+        const { assert!(N < Self::BITS) };
+        (self << N) | (self >> (Self::BITS - N))
+    }
+
+    fn ch(x: Self, y: Self, z: Self) -> Self {
+        (x & y) ^ ((!x) & z)
+    }
+    fn maj(x: Self, y: Self, z: Self) -> Self {
+        (x & y) ^ (x & z) ^ (y & z)
+    }
+    fn bsig0(x: Self) -> Self {
+        x.rotr::<28>() ^ x.rotr::<34>() ^ x.rotr::<39>()
+    }
+    fn bsig1(x: Self) -> Self {
+        x.rotr::<14>() ^ x.rotr::<18>() ^ x.rotr::<41>()
+    }
+    fn ssig0(x: Self) -> Self {
+        x.rotr::<1>() ^ x.rotr::<8>() ^ x.shr::<7>()
+    }
+    fn ssig1(x: Self) -> Self {
+        x.rotr::<19>() ^ x.rotr::<61>() ^ x.shr::<6>()
+    }
+}
+
+struct CCSha256 {
+    hash: [u32; 8],
+    table: [u32; 64],
+    state: [u32; 8],
+    buffer: Vec<u8>,
+    message_len: u64,
+}
+
+impl CCSha256 {
+    fn new() -> Self {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        const INITIAL: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        CCSha256 {
+            hash: INITIAL,
+            table: K,
+            state: INITIAL,
+            buffer: Vec::new(),
+            message_len: 0,
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.state = self.hash;
+    }
+
+    fn process_block(&mut self, content: &[u8; 64]) {
+        let mut buffer_msg = [0u32; 16];
+        let mut wt = [0u32; 64];
+
+        for (i, word_bytes) in content.chunks_exact(4).enumerate() {
+            buffer_msg[i] =
+                u32::from_be_bytes([word_bytes[0], word_bytes[1], word_bytes[2], word_bytes[3]]);
+        }
+
+        for t in 0..16 {
+            wt[t] = buffer_msg[t]
+        }
+        for t in 16..64 {
+            wt[t] = u32::ssig1(wt[t - 2])
+                .wrapping_add(wt[t - 7])
+                .wrapping_add(u32::ssig0(wt[t - 15]))
+                .wrapping_add(wt[t - 16]);
+        }
+
+        self.reset_state();
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+
+        for t in 0..64 {
+            let t1 = h
+                .wrapping_add(u32::bsig1(e))
+                .wrapping_add(u32::ch(e, f, g))
+                .wrapping_add(self.table[t])
+                .wrapping_add(wt[t]);
+
+            let t2 = u32::bsig0(a).wrapping_add(u32::maj(a, b, c));
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        self.state = [a, b, c, d, e, f, g, h];
+        self.update_hash();
+    }
+
+    fn update_hash(&mut self) {
+        self.hash = std::array::from_fn(|i| self.hash[i].wrapping_add(self.state[i]));
+    }
+
+    fn update(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.message_len += input.len() as u64;
+        self.buffer.extend_from_slice(input);
+
+        while self.buffer.len() >= 64 {
+            let block: Vec<u8> = self.buffer.drain(..64).collect();
+            self.process_block(&block.try_into().unwrap());
+        }
+    }
+
+    fn finalize(mut self) -> [u32; 8] {
+        let bit_len = self.message_len * 8;
+
+        self.buffer.push(0x80);
+
+        while self.buffer.len() % 64 != 56 {
+            self.buffer.push(0);
+        }
+
+        self.buffer.extend_from_slice(&bit_len.to_be_bytes());
+
+        let final_blocks = std::mem::take(&mut self.buffer);
+        for block in final_blocks.chunks_exact(64) {
+            self.process_block(block.try_into().unwrap());
+        }
+
+        self.hash
+    }
+}
+
+impl Default for CCSha256 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
 mod padding_test {
     use super::*;
-
-    #[test]
-    fn pads_empty_string() {
-        let padded = padding_content(Vec::from("".as_bytes()));
-        assert_eq!(padded.len(), 64);
-        assert_eq!(padded[0], 0x80);
-        assert_eq!(&padded[1..56], [0u8; 55]);
-        assert_eq!(&padded[56..64], &0u64.to_le_bytes());
-    }
-
-    #[test]
-    fn pads_single_a() {
-        let padded = padding_content(Vec::from("a".as_bytes()));
-        assert_eq!(padded.len(), 64);
-        assert_eq!(padded[0], 0x61);
-        assert_eq!(padded[1], 0x80);
-        assert_eq!(&padded[2..56], [0u8; 54]);
-        assert_eq!(&padded[56..64], &8u64.to_le_bytes());
-    }
 
     #[test]
     fn md5test1() {
