@@ -1,3 +1,4 @@
+use core::arch::x86_64::*;
 use md5::digest::consts::True;
 use md5::{Digest, Md5};
 use std::fs;
@@ -112,6 +113,8 @@ impl File {
             Ok(digest_msg_mine(&content))
         } else if config.alg == "sha256" {
             Ok(digest_sha256_msg_mine(&content))
+        } else if config.alg == "sha512" {
+            Ok(digest_sha512_msg_mine(&content))
         } else {
             Ok(digest_msg(&content))
         }
@@ -282,7 +285,14 @@ fn digest_sha256_msg_mine(contents: impl AsRef<[u8]>) -> String {
     let mut hasher = CCSha256::new();
     hasher.update(contents);
     let out = hasher.finalize();
-    out.iter().map(|byte| format!("{:02x}", byte)).collect()
+    out.iter().map(|byte| format!("{:08x}", byte)).collect()
+}
+
+fn digest_sha512_msg_mine(contents: impl AsRef<[u8]>) -> String {
+    let mut hasher = CCSha512::new();
+    hasher.update(contents);
+    let out = hasher.finalize();
+    out.iter().map(|byte| format!("{:016x}", byte)).collect()
 }
 
 const MAGIC: f64 = 4294967296.0;
@@ -563,10 +573,225 @@ impl Word for u64 {
     }
 }
 
+struct CCSha512 {
+    hash: [u64; 8],
+    table: [u64; 80],
+    buffer: Vec<u8>,
+    message_len: u128,
+}
+
+impl CCSha512 {
+    fn new() -> Self {
+        const K: [u64; 80] = [
+            0x428a2f98d728ae22,
+            0x7137449123ef65cd,
+            0xb5c0fbcfec4d3b2f,
+            0xe9b5dba58189dbbc,
+            0x3956c25bf348b538,
+            0x59f111f1b605d019,
+            0x923f82a4af194f9b,
+            0xab1c5ed5da6d8118,
+            0xd807aa98a3030242,
+            0x12835b0145706fbe,
+            0x243185be4ee4b28c,
+            0x550c7dc3d5ffb4e2,
+            0x72be5d74f27b896f,
+            0x80deb1fe3b1696b1,
+            0x9bdc06a725c71235,
+            0xc19bf174cf692694,
+            0xe49b69c19ef14ad2,
+            0xefbe4786384f25e3,
+            0x0fc19dc68b8cd5b5,
+            0x240ca1cc77ac9c65,
+            0x2de92c6f592b0275,
+            0x4a7484aa6ea6e483,
+            0x5cb0a9dcbd41fbd4,
+            0x76f988da831153b5,
+            0x983e5152ee66dfab,
+            0xa831c66d2db43210,
+            0xb00327c898fb213f,
+            0xbf597fc7beef0ee4,
+            0xc6e00bf33da88fc2,
+            0xd5a79147930aa725,
+            0x06ca6351e003826f,
+            0x142929670a0e6e70,
+            0x27b70a8546d22ffc,
+            0x2e1b21385c26c926,
+            0x4d2c6dfc5ac42aed,
+            0x53380d139d95b3df,
+            0x650a73548baf63de,
+            0x766a0abb3c77b2a8,
+            0x81c2c92e47edaee6,
+            0x92722c851482353b,
+            0xa2bfe8a14cf10364,
+            0xa81a664bbc423001,
+            0xc24b8b70d0f89791,
+            0xc76c51a30654be30,
+            0xd192e819d6ef5218,
+            0xd69906245565a910,
+            0xf40e35855771202a,
+            0x106aa07032bbd1b8,
+            0x19a4c116b8d2d0c8,
+            0x1e376c085141ab53,
+            0x2748774cdf8eeb99,
+            0x34b0bcb5e19b48a8,
+            0x391c0cb3c5c95a63,
+            0x4ed8aa4ae3418acb,
+            0x5b9cca4f7763e373,
+            0x682e6ff3d6b2b8a3,
+            0x748f82ee5defb2fc,
+            0x78a5636f43172f60,
+            0x84c87814a1f0ab72,
+            0x8cc702081a6439ec,
+            0x90befffa23631e28,
+            0xa4506cebde82bde9,
+            0xbef9a3f7b2c67915,
+            0xc67178f2e372532b,
+            0xca273eceea26619c,
+            0xd186b8c721c0c207,
+            0xeada7dd6cde0eb1e,
+            0xf57d4f7fee6ed178,
+            0x06f067aa72176fba,
+            0x0a637dc5a2c898a6,
+            0x113f9804bef90dae,
+            0x1b710b35131c471b,
+            0x28db77f523047d84,
+            0x32caab7b40c72493,
+            0x3c9ebe0a15c9bebc,
+            0x431d67c49c100d4c,
+            0x4cc5d4becb3e42b6,
+            0x597f299cfc657e2a,
+            0x5fcb6fab3ad6faec,
+            0x6c44198c4a475817,
+        ];
+        const INITIAL: [u64; 8] = [
+            0x6a09e667f3bcc908,
+            0xbb67ae8584caa73b,
+            0x3c6ef372fe94f82b,
+            0xa54ff53a5f1d36f1,
+            0x510e527fade682d1,
+            0x9b05688c2b3e6c1f,
+            0x1f83d9abfb41bd6b,
+            0x5be0cd19137e2179,
+        ];
+        CCSha512 {
+            hash: INITIAL,
+            table: K,
+            buffer: Vec::with_capacity(128),
+            message_len: 0,
+        }
+    }
+
+    fn message_schedule_scalar(content: &[u8; 128]) -> [u64; 80] {
+        let mut wt = [0u64; 80];
+
+        for (i, word_bytes) in content.chunks_exact(8).enumerate() {
+            wt[i] = u64::from_be_bytes([
+                word_bytes[0],
+                word_bytes[1],
+                word_bytes[2],
+                word_bytes[3],
+                word_bytes[4],
+                word_bytes[5],
+                word_bytes[6],
+                word_bytes[7],
+            ]);
+        }
+
+        for t in 16..80 {
+            wt[t] = u64::ssig1(wt[t - 2])
+                .wrapping_add(wt[t - 7])
+                .wrapping_add(u64::ssig0(wt[t - 15]))
+                .wrapping_add(wt[t - 16]);
+        }
+        wt
+    }
+
+    fn process_block_scalar(&mut self, content: &[u8; 128]) {
+        let wt = Self::message_schedule_scalar(content);
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.hash;
+
+        for t in 0..80 {
+            let t1 = h
+                .wrapping_add(u64::bsig1(e))
+                .wrapping_add(u64::ch(e, f, g))
+                .wrapping_add(self.table[t])
+                .wrapping_add(wt[t]);
+
+            let t2 = u64::bsig0(a).wrapping_add(u64::maj(a, b, c));
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        self.update_hash([a, b, c, d, e, f, g, h]);
+    }
+
+    fn update_hash(&mut self, state: [u64; 8]) {
+        self.hash = std::array::from_fn(|i| self.hash[i].wrapping_add(state[i]));
+    }
+
+    fn update(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.message_len += input.len() as u128;
+
+        let buffer_size = self.buffer.len();
+
+        if buffer_size + input.len() < 128 {
+            self.buffer.extend_from_slice(input);
+            return;
+        }
+
+        let take = 128 - buffer_size;
+        let mut offset = take;
+
+        self.buffer.extend_from_slice(&input[0..offset]);
+        //assert!(self.buffer.len() == 128);
+
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let base_block = buffer.as_slice().try_into().unwrap();
+        self.process_block_scalar(base_block);
+
+        while input.len() - offset >= 128 {
+            let block = &input[offset..(offset + 128)];
+            self.process_block_scalar(block.try_into().unwrap());
+            offset += 128;
+        }
+
+        buffer.clear();
+        buffer.extend_from_slice(&input[offset..]);
+        self.buffer = buffer;
+    }
+
+    fn finalize(mut self) -> [u64; 8] {
+        let bit_len = self.message_len * 8;
+
+        self.buffer.push(0x80);
+
+        while self.buffer.len() % 128 != 112 {
+            self.buffer.push(0);
+        }
+
+        self.buffer.extend_from_slice(&bit_len.to_be_bytes());
+
+        let final_blocks = std::mem::take(&mut self.buffer);
+        for block in final_blocks.chunks_exact(128) {
+            self.process_block_scalar(block.try_into().unwrap());
+        }
+
+        self.hash
+    }
+}
+
 struct CCSha256 {
     hash: [u32; 8],
     table: [u32; 64],
-    state: [u32; 8],
     buffer: Vec<u8>,
     message_len: u64,
 }
@@ -592,38 +817,235 @@ impl CCSha256 {
         CCSha256 {
             hash: INITIAL,
             table: K,
-            state: INITIAL,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(64),
             message_len: 0,
         }
     }
 
-    fn reset_state(&mut self) {
-        self.state = self.hash;
-    }
-
-    fn process_block(&mut self, content: &[u8; 64]) {
-        let mut buffer_msg = [0u32; 16];
+    fn message_schedule_scalar(content: &[u8; 64]) -> [u32; 64] {
         let mut wt = [0u32; 64];
 
         for (i, word_bytes) in content.chunks_exact(4).enumerate() {
-            buffer_msg[i] =
+            wt[i] =
                 u32::from_be_bytes([word_bytes[0], word_bytes[1], word_bytes[2], word_bytes[3]]);
         }
 
-        for t in 0..16 {
-            wt[t] = buffer_msg[t]
-        }
         for t in 16..64 {
             wt[t] = u32::ssig1(wt[t - 2])
                 .wrapping_add(wt[t - 7])
                 .wrapping_add(u32::ssig0(wt[t - 15]))
                 .wrapping_add(wt[t - 16]);
         }
+        wt
+    }
 
-        self.reset_state();
+    unsafe fn k4(table: &[u32; 64], t: usize) -> __m128i {
+        _mm_set_epi32(
+            table[t + 3] as i32,
+            table[t + 2] as i32,
+            table[t + 1] as i32,
+            table[t] as i32,
+        )
+    }
 
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+    unsafe fn load4_be(content: &[u8; 64], offset: usize) -> __m128i {
+        let w0 = u32::from_be_bytes([
+            content[offset],
+            content[offset + 1],
+            content[offset + 2],
+            content[offset + 3],
+        ]);
+
+        let w1 = u32::from_be_bytes([
+            content[offset + 4],
+            content[offset + 5],
+            content[offset + 6],
+            content[offset + 7],
+        ]);
+
+        let w2 = u32::from_be_bytes([
+            content[offset + 8],
+            content[offset + 9],
+            content[offset + 10],
+            content[offset + 11],
+        ]);
+
+        let w3 = u32::from_be_bytes([
+            content[offset + 12],
+            content[offset + 13],
+            content[offset + 14],
+            content[offset + 15],
+        ]);
+
+        _mm_set_epi32(w3 as i32, w2 as i32, w1 as i32, w0 as i32)
+    }
+
+    unsafe fn process_block_concurrent(&mut self, content: &[u8; 64]) {
+        let [a, b, c, d, e, f, g, h] = self.hash;
+
+        let mut h1 = [0u32; 4];
+        let mut h2 = [0u32; 4];
+
+        let a_init = _mm_set_epi32(c as i32, d as i32, g as i32, h as i32);
+        let b_init = _mm_set_epi32(a as i32, b as i32, e as i32, f as i32);
+
+        let mut A = a_init;
+        let mut B = b_init;
+
+        // W0..W15, four schedule words per vector.
+        let mut m0 = Self::load4_be(content, 0); // W0..W3
+        let mut m1 = Self::load4_be(content, 16); // W4..W7
+        let mut m2 = Self::load4_be(content, 32); // W8..W11
+        let mut m3 = Self::load4_be(content, 48); // W12..W15
+
+        // Rounds 0..15.
+        let wk = _mm_add_epi32(m0, Self::k4(&self.table, 0));
+        Self::rounds4(&mut A, &mut B, &wk);
+
+        let wk = _mm_add_epi32(m1, Self::k4(&self.table, 4));
+        Self::rounds4(&mut A, &mut B, &wk);
+
+        let wk = _mm_add_epi32(m2, Self::k4(&self.table, 8));
+        Self::rounds4(&mut A, &mut B, &wk);
+
+        let wk = _mm_add_epi32(m3, Self::k4(&self.table, 12));
+        Self::rounds4(&mut A, &mut B, &wk);
+        for block in 0..12 {
+            let t = 4 * block;
+
+            let b0 = _mm_set_epi32(
+                content[t + 16 + 3] as i32,
+                content[t + 16 + 2] as i32,
+                content[t + 16 + 1] as i32,
+                content[t + 16] as i32,
+            );
+            let b2 = _mm_set_epi32(
+                content[t + 16 + 8 + 3] as i32,
+                content[t + 16 + 8 + 2] as i32,
+                content[t + 16 + 8 + 1] as i32,
+                content[t + 16 + 8] as i32,
+            );
+            let b3 = _mm_set_epi32(
+                content[t + 16 + 12 + 3] as i32,
+                content[t + 16 + 12 + 2] as i32,
+                content[t + 16 + 12 + 1] as i32,
+                content[t + 16 + 12] as i32,
+            );
+
+            let b1_1 = _mm_set_epi32(0, 0, 0, wt[t + 4] as i32);
+            let mut sigma0 = _mm_sha256msg1_epu32(b0, b1_1);
+
+            let x = _mm_alignr_epi8(b3, b2, 4);
+            sigma0 = _mm_add_epi32(sigma0, x);
+
+            let wk = _mm_sha256msg2_epu32(sigma0, b3);
+
+            let kt = Self::k4(t);
+
+            let k = _mm_add_epi32(wk, kt);
+
+            Self::rounds4(&mut A, &mut B, &k);
+        }
+
+        A = _mm_add_epi32(A, A_init);
+        B = _mm_add_epi32(B, B_init);
+
+        _mm_storeu_si128(h1.as_mut_ptr().add(0) as *mut __m128i, A);
+        _mm_storeu_si128(h2.as_mut_ptr().add(0) as *mut __m128i, B);
+
+        let [f, e, b, a] = h2;
+        let [h, g, d, c] = h1;
+        self.hash = [a, b, c, d, e, f, g, h];
+    }
+
+    unsafe fn rounds4(a: &mut __m128i, b: &mut __m128i, wk: &__m128i) {
+        let mut tmp = _mm_sha256rnds2_epu32(*a, *b, *wk);
+        *a = *b;
+        *b = tmp;
+
+        let wk_hi = _mm_srli_si128(*wk, 8);
+        tmp = _mm_sha256rnds2_epu32(*a, *b, wk_hi);
+        *a = *b;
+        *b = tmp;
+    }
+
+    //unsafe fn message_schedule_paralel(content: &[u8; 64]) -> [u32; 64] {
+    //    let mut wt = [0u32; 64];
+
+    //    for block in 0..12 {
+    //        let t = 4 * block;
+
+    //        let b0 = _mm_set_epi32(
+    //            wt[t + 3] as i32,
+    //            wt[t + 2] as i32,
+    //            wt[t + 1] as i32,
+    //            wt[t] as i32,
+    //        );
+    //        let b2 = _mm_set_epi32(
+    //            wt[t + 8 + 3] as i32,
+    //            wt[t + 8 + 2] as i32,
+    //            wt[t + 8 + 1] as i32,
+    //            wt[t + 8] as i32,
+    //        );
+    //        let b3 = _mm_set_epi32(
+    //            wt[t + 12 + 3] as i32,
+    //            wt[t + 12 + 2] as i32,
+    //            wt[t + 12 + 1] as i32,
+    //            wt[t + 12] as i32,
+    //        );
+
+    //        let b1_1 = _mm_set_epi32(0, 0, 0, wt[t + 4] as i32);
+    //        let mut sigma0 = _mm_sha256msg1_epu32(b0, b1_1);
+
+    //        let x = _mm_alignr_epi8(b3, b2, 4);
+    //        sigma0 = _mm_add_epi32(sigma0, x);
+
+    //        let sigma1 = _mm_sha256msg2_epu32(sigma0, b3);
+
+    //        _mm_storeu_si128(wt.as_mut_ptr().add(t + 16) as *mut __m128i, sigma1);
+    //    }
+    //    wt
+    //}
+    //unsafe fn process_block_parallel(&mut self, content: &[u8; 64]) {
+    //    let wt = Self::message_schedule_paralel(content);
+
+    //    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.hash;
+
+    //    let mut h1 = [0u32; 4];
+    //    let mut h2 = [0u32; 4];
+
+    //    let A_init = _mm_set_epi32(c as i32, d as i32, g as i32, h as i32);
+    //    let B_init = _mm_set_epi32(a as i32, b as i32, e as i32, f as i32);
+
+    //    let mut A = _mm_set_epi32(c as i32, d as i32, g as i32, h as i32);
+    //    let mut B = _mm_set_epi32(a as i32, b as i32, e as i32, f as i32);
+
+    //    for t in 0..32 {
+    //        let k = _mm_set_epi32(
+    //            0,
+    //            0,
+    //            self.table[2 * t + 1].wrapping_add(wt[2 * t + 1]) as i32,
+    //            self.table[2 * t].wrapping_add(wt[2 * t]) as i32,
+    //        );
+    //        let inter = _mm_sha256rnds2_epu32(A, B, k);
+    //        A = B;
+    //        B = inter
+    //    }
+    //    A = _mm_add_epi32(A, A_init);
+    //    B = _mm_add_epi32(B, B_init);
+
+    //    _mm_storeu_si128(h1.as_mut_ptr().add(0) as *mut __m128i, A);
+    //    _mm_storeu_si128(h2.as_mut_ptr().add(0) as *mut __m128i, B);
+
+    //    let [f, e, b, a] = h2;
+    //    let [h, g, d, c] = h1;
+    //    self.hash = [a, b, c, d, e, f, g, h];
+    //}
+
+    fn process_block_scalar(&mut self, content: &[u8; 64]) {
+        let wt = Self::message_schedule_scalar(content);
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.hash;
 
         for t in 0..64 {
             let t1 = h
@@ -643,23 +1065,47 @@ impl CCSha256 {
             b = a;
             a = t1.wrapping_add(t2);
         }
-        self.state = [a, b, c, d, e, f, g, h];
-        self.update_hash();
+        self.update_hash([a, b, c, d, e, f, g, h]);
     }
 
-    fn update_hash(&mut self) {
-        self.hash = std::array::from_fn(|i| self.hash[i].wrapping_add(self.state[i]));
+    fn update_hash(&mut self, state: [u32; 8]) {
+        self.hash = std::array::from_fn(|i| self.hash[i].wrapping_add(state[i]));
     }
 
     fn update(&mut self, input: impl AsRef<[u8]>) {
         let input = input.as_ref();
         self.message_len += input.len() as u64;
-        self.buffer.extend_from_slice(input);
 
-        while self.buffer.len() >= 64 {
-            let block: Vec<u8> = self.buffer.drain(..64).collect();
-            self.process_block(&block.try_into().unwrap());
+        let buffer_size = self.buffer.len();
+
+        if buffer_size + input.len() < 64 {
+            self.buffer.extend_from_slice(input);
+            return;
         }
+
+        let take = 64 - buffer_size;
+        let mut offset = take;
+
+        self.buffer.extend_from_slice(&input[0..offset]);
+        //assert!(self.buffer.len() == 64);
+
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let base_block = buffer.as_slice().try_into().unwrap();
+        unsafe {
+            self.process_block_concurrent(base_block);
+        }
+
+        while input.len() - offset >= 64 {
+            let block = &input[offset..(offset + 64)];
+            unsafe {
+                self.process_block_concurrent(block.try_into().unwrap());
+            }
+            offset += 64;
+        }
+
+        buffer.clear();
+        buffer.extend_from_slice(&input[offset..]);
+        self.buffer = buffer;
     }
 
     fn finalize(mut self) -> [u32; 8] {
@@ -675,7 +1121,7 @@ impl CCSha256 {
 
         let final_blocks = std::mem::take(&mut self.buffer);
         for block in final_blocks.chunks_exact(64) {
-            self.process_block(block.try_into().unwrap());
+            self.process_block_scalar(block.try_into().unwrap());
         }
 
         self.hash
