@@ -839,6 +839,7 @@ impl CCSha256 {
         wt
     }
 
+    #[inline]
     unsafe fn k4(table: &[u32; 64], t: usize) -> __m128i {
         _mm_set_epi32(
             table[t + 3] as i32,
@@ -848,6 +849,7 @@ impl CCSha256 {
         )
     }
 
+    #[inline]
     unsafe fn load4_be(content: &[u8; 64], offset: usize) -> __m128i {
         let w0 = u32::from_be_bytes([
             content[offset],
@@ -880,6 +882,7 @@ impl CCSha256 {
         _mm_set_epi32(w3 as i32, w2 as i32, w1 as i32, w0 as i32)
     }
 
+    #[inline]
     unsafe fn process_block_concurrent(&mut self, content: &[u8; 64]) {
         let [a, b, c, d, e, f, g, h] = self.hash;
 
@@ -910,45 +913,25 @@ impl CCSha256 {
 
         let wk = _mm_add_epi32(m3, Self::k4(&self.table, 12));
         Self::rounds4(&mut A, &mut B, &wk);
+
         for block in 0..12 {
-            let t = 4 * block;
+            let next = Self::schedule_message(&mut m0, &mut m1, &mut m2, &mut m3);
 
-            let b0 = _mm_set_epi32(
-                content[t + 16 + 3] as i32,
-                content[t + 16 + 2] as i32,
-                content[t + 16 + 1] as i32,
-                content[t + 16] as i32,
-            );
-            let b2 = _mm_set_epi32(
-                content[t + 16 + 8 + 3] as i32,
-                content[t + 16 + 8 + 2] as i32,
-                content[t + 16 + 8 + 1] as i32,
-                content[t + 16 + 8] as i32,
-            );
-            let b3 = _mm_set_epi32(
-                content[t + 16 + 12 + 3] as i32,
-                content[t + 16 + 12 + 2] as i32,
-                content[t + 16 + 12 + 1] as i32,
-                content[t + 16 + 12] as i32,
-            );
+            let kt = Self::k4(&self.table, 4 * block + 16);
+            let k = _mm_add_epi32(next, kt);
 
-            let b1_1 = _mm_set_epi32(0, 0, 0, wt[t + 4] as i32);
-            let mut sigma0 = _mm_sha256msg1_epu32(b0, b1_1);
-
-            let x = _mm_alignr_epi8(b3, b2, 4);
-            sigma0 = _mm_add_epi32(sigma0, x);
-
-            let wk = _mm_sha256msg2_epu32(sigma0, b3);
-
-            let kt = Self::k4(t);
-
-            let k = _mm_add_epi32(wk, kt);
-
+            // Computes 4 rounds
             Self::rounds4(&mut A, &mut B, &k);
+
+            // Shift the message to compute on the next round
+            m0 = m1;
+            m1 = m2;
+            m2 = m3;
+            m3 = next;
         }
 
-        A = _mm_add_epi32(A, A_init);
-        B = _mm_add_epi32(B, B_init);
+        A = _mm_add_epi32(A, a_init);
+        B = _mm_add_epi32(B, b_init);
 
         _mm_storeu_si128(h1.as_mut_ptr().add(0) as *mut __m128i, A);
         _mm_storeu_si128(h2.as_mut_ptr().add(0) as *mut __m128i, B);
@@ -958,6 +941,24 @@ impl CCSha256 {
         self.hash = [a, b, c, d, e, f, g, h];
     }
 
+    #[inline]
+    #[target_feature(enable = "sha")]
+    unsafe fn schedule_message(
+        m0: &mut __m128i,
+        m1: &mut __m128i,
+        m2: &mut __m128i,
+        m3: &mut __m128i,
+    ) -> __m128i {
+        let mut sigma0 = _mm_sha256msg1_epu32(*m0, *m1);
+
+        let x = _mm_alignr_epi8(*m3, *m2, 4);
+        sigma0 = _mm_add_epi32(sigma0, x);
+
+        _mm_sha256msg2_epu32(sigma0, *m3)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sha")]
     unsafe fn rounds4(a: &mut __m128i, b: &mut __m128i, wk: &__m128i) {
         let mut tmp = _mm_sha256rnds2_epu32(*a, *b, *wk);
         *a = *b;
