@@ -1,6 +1,13 @@
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 use md5::digest::consts::True;
 use md5::{Digest, Md5};
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::uint32x4_t;
+use std::arch::aarch64::{
+    vaddq_u32, vld1q_u32, vsha256h2q_u32, vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32,
+    vst1q_u32,
+};
 use std::fs;
 use std::io::{self, Read};
 
@@ -839,6 +846,28 @@ impl CCSha256 {
         wt
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn k4(table: &[u32; 64], t: usize) -> uint32x4_t {
+        vld1q_u32(table[t..t + 4].as_ptr())
+    }
+
+    #[inline(always)]
+    fn k4_scalar(table: &[u32; 64], t: usize) -> [u32; 4] {
+        [table[t], table[t + 1], table[t + 2], table[t + 3]]
+    }
+
+    #[inline(always)]
+    fn add4(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+        [
+            a[0].wrapping_add(b[0]),
+            a[1].wrapping_add(b[1]),
+            a[2].wrapping_add(b[2]),
+            a[3].wrapping_add(b[3]),
+        ]
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline]
     unsafe fn k4(table: &[u32; 64], t: usize) -> __m128i {
         _mm_set_epi32(
@@ -849,6 +878,7 @@ impl CCSha256 {
         )
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline]
     unsafe fn load4_be(content: &[u8; 64], offset: usize) -> __m128i {
         let w0 = u32::from_be_bytes([
@@ -882,6 +912,193 @@ impl CCSha256 {
         _mm_set_epi32(w3 as i32, w2 as i32, w1 as i32, w0 as i32)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn load4_be(content: &[u8; 64], offset: usize) -> uint32x4_t {
+        let w0 = u32::from_be_bytes([
+            content[offset],
+            content[offset + 1],
+            content[offset + 2],
+            content[offset + 3],
+        ]);
+
+        let w1 = u32::from_be_bytes([
+            content[offset + 4],
+            content[offset + 5],
+            content[offset + 6],
+            content[offset + 7],
+        ]);
+
+        let w2 = u32::from_be_bytes([
+            content[offset + 8],
+            content[offset + 9],
+            content[offset + 10],
+            content[offset + 11],
+        ]);
+
+        let w3 = u32::from_be_bytes([
+            content[offset + 12],
+            content[offset + 13],
+            content[offset + 14],
+            content[offset + 15],
+        ]);
+
+        unsafe { vld1q_u32([w0, w1, w2, w3].as_ptr()) }
+    }
+
+    #[inline]
+    fn load4_be_batch(content: &[u8; 64], offset: usize) -> [u32; 4] {
+        let w0 = u32::from_be_bytes([
+            content[offset],
+            content[offset + 1],
+            content[offset + 2],
+            content[offset + 3],
+        ]);
+
+        let w1 = u32::from_be_bytes([
+            content[offset + 4],
+            content[offset + 5],
+            content[offset + 6],
+            content[offset + 7],
+        ]);
+
+        let w2 = u32::from_be_bytes([
+            content[offset + 8],
+            content[offset + 9],
+            content[offset + 10],
+            content[offset + 11],
+        ]);
+
+        let w3 = u32::from_be_bytes([
+            content[offset + 12],
+            content[offset + 13],
+            content[offset + 14],
+            content[offset + 15],
+        ]);
+
+        [w0, w1, w2, w3]
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn process_block_concurrent(&mut self, content: &[u8; 64]) {
+        let [a, b, c, d, e, f, g, h] = self.hash;
+
+        let mut h1 = [0u32; 4];
+        let mut h2 = [0u32; 4];
+
+        unsafe {
+            let a_init = vld1q_u32(self.hash[0..4].as_ptr());
+            let b_init = vld1q_u32(self.hash[4..].as_ptr());
+
+            let mut A = a_init;
+            let mut B = b_init;
+
+            // W0..W15, four schedule words per vector.
+            let mut m0 = Self::load4_be(content, 0); // W0..W3
+            let mut m1 = Self::load4_be(content, 16); // W4..W7
+            let mut m2 = Self::load4_be(content, 32); // W8..W11
+            let mut m3 = Self::load4_be(content, 48); // W12..W15
+
+            // Rounds 0..15.
+            let wk = vaddq_u32(m0, Self::k4(&self.table, 0));
+            Self::rounds4(&mut A, &mut B, &wk);
+
+            let wk = vaddq_u32(m1, Self::k4(&self.table, 4));
+            Self::rounds4(&mut A, &mut B, &wk);
+
+            let wk = vaddq_u32(m2, Self::k4(&self.table, 8));
+            Self::rounds4(&mut A, &mut B, &wk);
+
+            let wk = vaddq_u32(m3, Self::k4(&self.table, 12));
+            Self::rounds4(&mut A, &mut B, &wk);
+
+            for block in 0..12 {
+                let next = Self::schedule_message(&mut m0, &mut m1, &mut m2, &mut m3);
+
+                let kt = Self::k4(&self.table, 4 * block + 16);
+                let k = vaddq_u32(next, kt);
+
+                // Computes 4 rounds
+                Self::rounds4(&mut A, &mut B, &k);
+
+                // Shift the message to compute on the next round
+                m0 = m1;
+                m1 = m2;
+                m2 = m3;
+                m3 = next;
+            }
+
+            A = vaddq_u32(A, a_init);
+            B = vaddq_u32(B, b_init);
+
+            vst1q_u32(h1.as_mut_ptr().add(0) as *mut u32, A);
+            vst1q_u32(h2.as_mut_ptr().add(0) as *mut u32, B);
+        }
+
+        let [e, f, g, h] = h2;
+        let [a, b, c, d] = h1;
+        self.hash = [a, b, c, d, e, f, g, h];
+    }
+
+    fn process_block_concurrent_scalar(&mut self, content: &[u8; 64]) {
+        let [a, b, c, d, e, f, g, h] = self.hash;
+
+        let mut h1 = [0u32; 4];
+        let mut h2 = [0u32; 4];
+
+        unsafe {
+            let a_init: [u32; 4] = self.hash[0..4].try_into().unwrap();
+            let b_init: [u32; 4] = self.hash[4..8].try_into().unwrap();
+
+            let mut A: [u32; 4] = a_init;
+            let mut B: [u32; 4] = b_init;
+
+            // W0..W15, four schedule words per vector.
+            let mut m0 = Self::load4_be_batch(content, 0); // W0..W3
+            let mut m1 = Self::load4_be_batch(content, 16); // W4..W7
+            let mut m2 = Self::load4_be_batch(content, 32); // W8..W11
+            let mut m3 = Self::load4_be_batch(content, 48); // W12..W15
+
+            // Rounds 0..15.
+            let wk = Self::add4(m0, Self::k4_scalar(&self.table, 0));
+            Self::rounds4_scalar(&mut A, &mut B, &wk);
+
+            let wk = Self::add4(m1, Self::k4_scalar(&self.table, 4));
+            Self::rounds4_scalar(&mut A, &mut B, &wk);
+
+            let wk = Self::add4(m2, Self::k4_scalar(&self.table, 8));
+            Self::rounds4_scalar(&mut A, &mut B, &wk);
+
+            let wk = Self::add4(m3, Self::k4_scalar(&self.table, 12));
+            Self::rounds4_scalar(&mut A, &mut B, &wk);
+
+            for block in 0..12 {
+                let next = Self::schedule_message_batch(&mut m0, &mut m1, &mut m2, &mut m3);
+
+                let kt = Self::k4_scalar(&self.table, 4 * block + 16);
+                let k = Self::add4(next, kt);
+
+                // Computes 4 rounds
+                Self::rounds4_scalar(&mut A, &mut B, &k);
+
+                // Shift the message to compute on the next round
+                m0 = m1;
+                m1 = m2;
+                m2 = m3;
+                m3 = next;
+            }
+
+            A = Self::add4(A, a_init);
+            B = Self::add4(B, b_init);
+        }
+
+        let [e, f, g, h] = h2;
+        let [a, b, c, d] = h1;
+        self.hash = [a, b, c, d, e, f, g, h];
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline]
     unsafe fn process_block_concurrent(&mut self, content: &[u8; 64]) {
         let [a, b, c, d, e, f, g, h] = self.hash;
@@ -941,6 +1158,7 @@ impl CCSha256 {
         self.hash = [a, b, c, d, e, f, g, h];
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline]
     #[target_feature(enable = "sha")]
     unsafe fn schedule_message(
@@ -957,6 +1175,7 @@ impl CCSha256 {
         _mm_sha256msg2_epu32(sigma0, *m3)
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline]
     #[target_feature(enable = "sha")]
     unsafe fn rounds4(a: &mut __m128i, b: &mut __m128i, wk: &__m128i) {
@@ -968,6 +1187,86 @@ impl CCSha256 {
         tmp = _mm_sha256rnds2_epu32(*a, *b, wk_hi);
         *a = *b;
         *b = tmp;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    #[target_feature(enable = "sha2")]
+    unsafe fn rounds4(a: &mut uint32x4_t, b: &mut uint32x4_t, wk: &uint32x4_t) {
+        let old_upper = *a;
+        let new_upper = vsha256hq_u32(*a, *b, *wk);
+
+        let new_lower = vsha256h2q_u32(*b, old_upper, *wk);
+
+        *a = new_upper;
+        *b = new_lower;
+    }
+
+    fn schedule_message_batch(
+        m0: &[u32; 4],
+        m1: &[u32; 4],
+        m2: &[u32; 4],
+        m3: &[u32; 4],
+    ) -> [u32; 4] {
+        let m4_0 = u32::ssig1(m3[2]) + m2[1] + u32::ssig0(m0[1]) + m0[0];
+        let m4_1 = u32::ssig1(m3[3]) + m2[2] + u32::ssig0(m0[2]) + m0[1];
+        let m4_2 = u32::ssig1(m4_0) + m2[3] + u32::ssig0(m0[3]) + m0[2];
+        let m4_3 = u32::ssig1(m4_1) + m3[0] + u32::ssig0(m1[0]) + m0[3];
+        [m4_0, m4_1, m4_2, m4_3]
+    }
+
+    #[inline(always)]
+    fn rounds4_scalar(upper: &mut [u32; 4], lower: &mut [u32; 4], wk: &[u32; 4]) {
+        let mut a = upper[0];
+        let mut b = upper[1];
+        let mut c = upper[2];
+        let mut d = upper[3];
+
+        let mut e = lower[0];
+        let mut f = lower[1];
+        let mut g = lower[2];
+        let mut h = lower[3];
+
+        for i in 0..4 {
+            let t1 = h
+                .wrapping_add(u32::ssig1(e))
+                .wrapping_add(u32::ch(e, f, g))
+                .wrapping_add(wk[i]);
+
+            let t2 = u32::ssig0(a).wrapping_add(u32::maj(a, b, c));
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+
+        upper[0] = a;
+        upper[1] = b;
+        upper[2] = c;
+        upper[3] = d;
+
+        lower[0] = e;
+        lower[1] = f;
+        lower[2] = g;
+        lower[3] = h;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    #[target_feature(enable = "sha2")]
+    unsafe fn schedule_message(
+        m0: &mut uint32x4_t,
+        m1: &mut uint32x4_t,
+        m2: &mut uint32x4_t,
+        m3: &mut uint32x4_t,
+    ) -> uint32x4_t {
+        let lower = vsha256su0q_u32(*m0, *m1);
+        vsha256su1q_u32(lower, *m2, *m3)
     }
 
     //unsafe fn message_schedule_paralel(content: &[u8; 64]) -> [u32; 64] {
