@@ -1014,7 +1014,7 @@ impl CCSha256 {
             Self::rounds4(&mut A, &mut B, &wk);
 
             for block in 0..12 {
-                let next = Self::schedule_message(&mut m0, &mut m1, &mut m2, &mut m3);
+                let next = Self::message_schedule_simd_batch(&mut m0, &mut m1, &mut m2, &mut m3);
 
                 let kt = Self::k4(&self.table, 4 * block + 16);
                 let k = vaddq_u32(next, kt);
@@ -1074,7 +1074,7 @@ impl CCSha256 {
             Self::rounds4_scalar(&mut A, &mut B, &wk);
 
             for block in 0..12 {
-                let next = Self::schedule_message_batch(&mut m0, &mut m1, &mut m2, &mut m3);
+                let next = Self::message_schedule_batch(&mut m0, &mut m1, &mut m2, &mut m3);
 
                 let kt = Self::k4_scalar(&self.table, 4 * block + 16);
                 let k = Self::add4(next, kt);
@@ -1132,7 +1132,7 @@ impl CCSha256 {
         Self::rounds4(&mut A, &mut B, &wk);
 
         for block in 0..12 {
-            let next = Self::schedule_message(&mut m0, &mut m1, &mut m2, &mut m3);
+            let next = Self::message_schedule_simd_batch(&mut m0, &mut m1, &mut m2, &mut m3);
 
             let kt = Self::k4(&self.table, 4 * block + 16);
             let k = _mm_add_epi32(next, kt);
@@ -1161,7 +1161,7 @@ impl CCSha256 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline]
     #[target_feature(enable = "sha")]
-    unsafe fn schedule_message(
+    unsafe fn message_schedule_simd_batch(
         m0: &mut __m128i,
         m1: &mut __m128i,
         m2: &mut __m128i,
@@ -1202,7 +1202,7 @@ impl CCSha256 {
         *b = new_lower;
     }
 
-    fn schedule_message_batch(
+    fn message_schedule_batch(
         m0: &[u32; 4],
         m1: &[u32; 4],
         m2: &[u32; 4],
@@ -1259,7 +1259,7 @@ impl CCSha256 {
     #[cfg(target_arch = "aarch64")]
     #[inline]
     #[target_feature(enable = "sha2")]
-    unsafe fn schedule_message(
+    unsafe fn message_schedule_simd_batch(
         m0: &mut uint32x4_t,
         m1: &mut uint32x4_t,
         m2: &mut uint32x4_t,
